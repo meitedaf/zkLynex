@@ -158,7 +158,7 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
         emit TakenFeeWithdrawn(owner(), amount);
     }
 
-    //TODO need test the ETH swap
+    //TODO need to add the ETH swap
     function swapForward(
         uint256[2] calldata _proofA,
         uint256[2][2] calldata _proofB,
