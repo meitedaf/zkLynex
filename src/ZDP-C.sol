@@ -7,6 +7,8 @@ import "openzeppelin-contracts/contracts/access/Ownable2Step.sol";
 import "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 import "./interface/ISwapRouter.sol";
 import "./zk.sol";
+import "./lib/Path.sol";
+import "./lib/TransferHelper.sol";
 
 contract ZDPc is Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -25,7 +27,6 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
 
     struct Order {
         OrderDetails t;
-        // bytes32 HOs;
         bytes16 HOsF;
         bytes16 HOsE;
     }
@@ -35,12 +36,15 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
         ExactOutput
     }
 
+    uint24 constant FEE = 3000;
     address public agent;
     ISwapRouter public router;
     Groth16Verifier public verifier;
 
     mapping(address => Order[]) public orderbook;
     mapping(address => uint256) public gasfee;
+    uint256 public constant MAX_ACTIVE_ORDER = 10;
+    mapping(address => uint256[]) public activeOrders;
 
     modifier onlyAgent() {
         require(msg.sender == agent, "only agent can call this function");
@@ -50,6 +54,7 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
     event AgentChanged(address indexed oldAgent, address indexed newAgent);
     event RouterChanged(address indexed oldRouter, address indexed newRouter);
     event VerifierChanged(address indexed oldVerifier, address indexed newVerifier);
+
     event OrderStored(
         address indexed swapper,
         uint256 indexed index,
@@ -57,7 +62,9 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
         address tokenOut,
         uint256 exchangeRate,
         uint256 deadline,
-        bool OrderIsExecuted
+        bool OrderIsExecuted,
+        bool isMultiPath,
+        bytes encodedPath
     );
     event OrderExecuted(
         address swapper,
@@ -66,7 +73,9 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
         address tokenOut,
         uint256 exchangeRate,
         uint256 deadline,
-        bool OrderIsExecuted
+        bool OrderIsExecuted,
+        bool isMultiPath,
+        bytes encodedPath
     );
     event OrderCancelled(
         address swapper,
@@ -75,13 +84,16 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
         address tokenOut,
         uint256 exchangeRate,
         uint256 deadline,
-        bool OrderIsExecuted
+        bool OrderIsExecuted,
+        bool isMultiPath,
+        bytes encodedPath
     );
     event FeeDeposit(address indexed swapper, uint256 indexed fee);
     event FeeWithdrawn(address indexed swapper, uint256 indexed fee);
     event FeeTaken(address indexed swapper, uint256 indexed fee);
     event TakenFeeWithdrawn(address indexed owner, uint256 indexed fee);
-
+    event HOS(bytes16 indexed HOsF, bytes16 indexed HOsE);
+ 
     constructor(address _agent, address payable _router, address _verifier, address _owner) Ownable(_owner) {
         require(_agent != address(0));
         require(_router != address(0));
@@ -111,11 +123,28 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
     }
 
     function addPendingOrder(Order memory _order) external {
-        //@todo check order
         checkOrder(_order);
-        require(!_order.t.OrderIsExecuted, "cannot be executed");
+        require(activeOrders[_order.t.swapper].length < MAX_ACTIVE_ORDER, "too many active orders");
+        // Ensure the user does not exceed the maximum active orders
+        Order memory tempOrder = Order({
+             t:OrderDetails({
+                 swapper: _order.t.swapper,
+                 recipient: _order.t.recipient,
+                 tokenIn: _order.t.tokenIn,
+                 tokenOut: _order.t.tokenOut,
+                 exchangeRate: _order.t.exchangeRate,
+                 deadline: _order.t.deadline,
+                 OrderIsExecuted: false,
+                 isMultiPath: _order.t.isMultiPath,
+                 encodedPath: _order.t.encodedPath
+             }),
+             HOsF: _order.HOsF,
+             HOsE: _order.HOsE
+         });
         uint256 index = orderbook[_order.t.swapper].length;
-        orderbook[_order.t.swapper].push(_order);
+        orderbook[_order.t.swapper].push(tempOrder);        
+        // Record the index of the new order in the activeOrders mapping
+        activeOrders[_order.t.swapper].push(index);
 
         emit OrderStored(
             msg.sender,
@@ -124,7 +153,9 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
             _order.t.tokenOut,
             _order.t.exchangeRate,
             _order.t.deadline,
-            _order.t.OrderIsExecuted
+            false,
+            _order.t.isMultiPath,
+            _order.t.encodedPath
         );
     }
 
@@ -148,7 +179,7 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
         emit FeeWithdrawn(msg.sender, amount);
     }
 
-    function withdrawTakenFee() external onlyOwner {
+    function withdrawTakenFee() external onlyOwner nonReentrant {
         uint256 amount = gasfee[owner()];
 
         gasfee[owner()] = 0;
@@ -158,7 +189,6 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
         emit TakenFeeWithdrawn(owner(), amount);
     }
 
-    //TODO need to add the ETH swap
     function swapForward(
         uint256[2] calldata _proofA,
         uint256[2][2] calldata _proofB,
@@ -168,9 +198,8 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
         uint256 a0e,
         uint256 a1m,
         uint256 _gasFee,
-        OrderType _type,
-        bytes calldata _encodedPath
-    ) external payable onlyAgent {
+        OrderType _type
+    ) external onlyAgent {
         Order memory pendingOrder = orderbook[swapper][index];
         address recipient = pendingOrder.t.recipient;
         address tokenIn = pendingOrder.t.tokenIn;
@@ -188,10 +217,16 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
 
         require(verifier.verifyProof(_proofA, _proofB, _proofC, signals), "Proof is not valid");
 
+        // Transfer `amountIn` of tokenIn to this contract.
+        TransferHelper.safeTransferFrom(tokenIn, swapper, address(this), a0e);
+
+        // Approve the router to spend tokenIn.
+        TransferHelper.safeApprove(tokenIn, address(router), a0e);
+
         if (_type == OrderType.ExactInput) {
             if (pendingOrder.t.isMultiPath) {
                 ISwapRouter.ExactInputParams memory params = ISwapRouter.ExactInputParams({
-                    path: _encodedPath,
+                    path: pendingOrder.t.encodedPath,
                     recipient: recipient,
                     deadline: pendingOrder.t.deadline,
                     amountIn: a0e,
@@ -202,7 +237,7 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
                 ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
                     tokenIn: tokenIn,
                     tokenOut: tokenOut,
-                    fee: 3000,
+                    fee: FEE,
                     recipient: recipient,
                     deadline: pendingOrder.t.deadline,
                     amountIn: a0e,
@@ -212,27 +247,33 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
                 router.exactInputSingle(params);
             }
         } else if (_type == OrderType.ExactOutput) {
+            uint256 amountIn;
             if (pendingOrder.t.isMultiPath) {
                 ISwapRouter.ExactOutputParams memory params = ISwapRouter.ExactOutputParams({
-                    path: _encodedPath,
+                    path: pendingOrder.t.encodedPath,
                     recipient: recipient,
                     deadline: pendingOrder.t.deadline,
                     amountOut: a1m,
                     amountInMaximum: a0e
                 });
-                router.exactOutput(params);
+                amountIn = router.exactOutput(params);
             } else {
                 ISwapRouter.ExactOutputSingleParams memory params = ISwapRouter.ExactOutputSingleParams({
                     tokenIn: tokenIn,
                     tokenOut: tokenOut,
-                    fee: 3000,
+                    fee: FEE,
                     recipient: recipient,
                     deadline: pendingOrder.t.deadline,
                     amountOut: a1m,
                     amountInMaximum: a0e,
                     sqrtPriceLimitX96: 0
                 });
-                router.exactOutputSingle(params);
+                amountIn = router.exactOutputSingle(params);
+            }
+            // If the swap did not require the full amountInMaximum to achieve the exact amountOut then we refund msg.sender and approve the router to spend 0.
+            if (amountIn < a0e) {
+                TransferHelper.safeApprove(tokenIn, address(router), 0);
+                TransferHelper.safeTransfer(tokenIn, swapper, a0e - amountIn);
             }
         }
 
@@ -245,7 +286,9 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
             pendingOrder.t.tokenOut,
             pendingOrder.t.exchangeRate,
             pendingOrder.t.deadline,
-            pendingOrder.t.OrderIsExecuted
+            pendingOrder.t.OrderIsExecuted,
+            pendingOrder.t.isMultiPath,
+            pendingOrder.t.encodedPath
         );
     }
 
@@ -260,37 +303,65 @@ contract ZDPc is Ownable2Step, ReentrancyGuard {
     }
 
     function cancelOrder(uint256 index) external {
-        require(!orderbook[msg.sender][index].t.OrderIsExecuted, "already executed");
-        require(orderbook[msg.sender][index].t.recipient != address(0), "recipient does not exist");
+        // Use storage so that modifications persist
+        Order storage order = orderbook[msg.sender][index];
+        require(!order.t.OrderIsExecuted, "already executed");
+        require(order.t.recipient != address(0), "recipient does not exist");
+        require(block.timestamp <= order.t.deadline, "order expired");
 
-        Order memory tempOrder;
-        uint256 len = orderbook[msg.sender].length;
-        tempOrder = orderbook[msg.sender][len - 1];
-        orderbook[msg.sender][len - 1] = orderbook[msg.sender][index];
-        orderbook[msg.sender][index] = tempOrder;
-        orderbook[msg.sender].pop();
-        //@todo need auto withdraw fee?
-        // if(orderbook[msg.sender].length == 0 && takeFee){
-        //     withdrawAllFee();
-        // }
+        // Mark the order as cancelled by setting OrderIsExecuted to true
+        order.t.OrderIsExecuted = true;
+
+        // Remove the order index from the activeOrders array
+        uint256[] storage active = activeOrders[msg.sender];
+        for (uint256 i = 0; i < active.length; i++) {
+            if (active[i] == index) {
+                active[i] = active[active.length - 1];
+                active.pop();
+                break;
+            }
+        }
 
         emit OrderCancelled(
             msg.sender,
             index,
-            tempOrder.t.tokenIn,
-            tempOrder.t.tokenOut,
-            tempOrder.t.exchangeRate,
-            tempOrder.t.deadline,
-            tempOrder.t.OrderIsExecuted
+            order.t.tokenIn,
+            order.t.tokenOut,
+            order.t.exchangeRate,
+            order.t.deadline,
+            order.t.OrderIsExecuted,
+            order.t.isMultiPath,
+            order.t.encodedPath
         );
     }
 
     function checkOrder(Order memory _order) internal view returns (bool) {
-        require(block.timestamp < _order.t.deadline, "order expired");
-        require(_order.t.tokenIn != _order.t.tokenOut, "tokenIn == tokenOut");
+        require(block.timestamp <= _order.t.deadline, "order expired");
         require(_order.t.recipient != address(0), "recipient must be non-zero address");
         require(_order.t.exchangeRate != 0, "exchangeRate must be non-zero value");
         require(_order.t.swapper == msg.sender, "only swapper can store order");
+        if (_order.t.isMultiPath) {
+            require(Path.hasMultiplePools(_order.t.encodedPath), "encodedPath must be non-zero length");
+            (address _tokenIn,,) = Path.decodeFirstPool(_order.t.encodedPath);
+            require(_tokenIn == _order.t.tokenIn, "first pool must be tokenIn");
+        } else {
+            require(_order.t.encodedPath.length == 0, "encodedPath must be zero length");
+            require(_order.t.tokenIn != _order.t.tokenOut, "tokenIn and tokenOut cannot be the same");
+        }
+        require(_order.HOsE != 0, "HOsE must be non-zero value");
+        require(_order.HOsF != 0, "HOsF must be non-zero value");
         return true;
+    }
+
+    function getOrders(address swapper) external view returns (Order[] memory) {
+        return orderbook[swapper];
+    }
+
+    function getOrder(address swapper, uint256 index) external view returns (Order memory) {
+        return orderbook[swapper][index];
+    }
+
+    function getActiveOrders(address swapper) external view returns (uint256[] memory) {
+        return activeOrders[swapper];
     }
 }
